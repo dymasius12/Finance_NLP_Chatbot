@@ -4,9 +4,9 @@ import tempfile
 import requests
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.llms import HuggingFaceHub
+from langchain_huggingface import HuggingFaceEndpoint
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 import pandas as pd
@@ -180,7 +180,7 @@ def process_documents(file_paths):
             st.error("No text chunks were created. Documents may be empty or unreadable.")
             return None
         
-        # Create embeddings
+        # Create embeddings using the updated HuggingFaceEmbeddings from langchain_huggingface
         try:
             embeddings = HuggingFaceEmbeddings(
                 model_name="sentence-transformers/all-MiniLM-L6-v2"
@@ -190,7 +190,7 @@ def process_documents(file_paths):
             st.session_state.error_message = f"Error loading embeddings model: {str(e)}\n{traceback.format_exc()}"
             return None
         
-        # Create vector store using FAISS instead of Chroma
+        # Create vector store using FAISS
         try:
             vectorstore = FAISS.from_documents(
                 documents=chunks,
@@ -213,9 +213,9 @@ def process_documents(file_paths):
             st.warning("⚠️ Hugging Face API token not found. The chatbot will retrieve documents but won't generate answers.")
             return retriever
         
-        # Create language model
+        # Create language model using the updated HuggingFaceEndpoint from langchain_huggingface
         try:
-            llm = HuggingFaceHub(
+            llm = HuggingFaceEndpoint(
                 repo_id="google/flan-t5-base",  # Using a more stable model
                 huggingfacehub_api_token=huggingface_api_token,
                 model_kwargs={"temperature": 0.5, "max_length": 512}
@@ -284,6 +284,7 @@ with st.sidebar:
     if st.button("Process Documents"):
         # Clear previous error message
         st.session_state.error_message = None
+        st.session_state.document_sources = []
         
         with st.spinner("Processing documents..."):
             file_paths = []
