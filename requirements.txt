@@ -1,7 +1,4 @@
 streamlit
 langchain
 langchain-community
-chromadb
-sentence-transformers
 pypdf
-huggingface_hub
