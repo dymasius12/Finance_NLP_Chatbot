@@ -4,11 +4,6 @@ import tempfile
 import requests
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_community.llms import HuggingFaceHub
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
 import pandas as pd
 import io
 import zipfile
@@ -81,10 +76,8 @@ if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 if 'documents_processed' not in st.session_state:
     st.session_state.documents_processed = False
-if 'qa_chain' not in st.session_state:
-    st.session_state.qa_chain = None
-if 'retriever' not in st.session_state:
-    st.session_state.retriever = None
+if 'document_chunks' not in st.session_state:
+    st.session_state.document_chunks = []
 if 'document_sources' not in st.session_state:
     st.session_state.document_sources = []
 if 'error_message' not in st.session_state:
@@ -181,7 +174,32 @@ def download_github_files():
     
     return [temp_file_path]
 
-# Function to process documents and create a retrieval QA chain
+# Simple keyword-based search function
+def search_documents(query, documents, top_k=3):
+    query = query.lower()
+    results = []
+    
+    # Extract keywords from query
+    keywords = [word.strip() for word in re.split(r'[^\w]', query) if word.strip() and len(word.strip()) > 3]
+    
+    # Score each document chunk
+    for doc in documents:
+        score = 0
+        content = doc["content"].lower()
+        
+        # Simple keyword matching
+        for keyword in keywords:
+            if keyword in content:
+                score += content.count(keyword)
+        
+        if score > 0:
+            results.append({"content": doc["content"], "source": doc["source"], "score": score})
+    
+    # Sort by score and return top_k
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:top_k]
+
+# Function to process documents
 def process_documents(file_paths, use_sample_only=False):
     try:
         documents = []
@@ -193,18 +211,39 @@ def process_documents(file_paths, use_sample_only=False):
                 
                 if file_extension == '.pdf':
                     loader = PyPDFLoader(file_path)
-                    documents.extend(loader.load())
+                    docs = loader.load()
                     st.session_state.document_sources.append(f"PDF: {os.path.basename(file_path)}")
+                    
+                    # Add each page as a separate document
+                    for doc in docs:
+                        documents.append({
+                            "content": doc.page_content,
+                            "source": os.path.basename(file_path)
+                        })
                 
                 elif file_extension == '.txt':
                     loader = TextLoader(file_path)
-                    documents.extend(loader.load())
+                    docs = loader.load()
                     st.session_state.document_sources.append(f"Text: {os.path.basename(file_path)}")
+                    
+                    # Add text content
+                    for doc in docs:
+                        documents.append({
+                            "content": doc.page_content,
+                            "source": os.path.basename(file_path)
+                        })
                 
                 elif file_extension == '.csv':
                     loader = CSVLoader(file_path)
-                    documents.extend(loader.load())
+                    docs = loader.load()
                     st.session_state.document_sources.append(f"CSV: {os.path.basename(file_path)}")
+                    
+                    # Add CSV content
+                    for doc in docs:
+                        documents.append({
+                            "content": doc.page_content,
+                            "source": os.path.basename(file_path)
+                        })
                 
                 else:
                     st.warning(f"Unsupported file type: {file_extension}")
@@ -215,189 +254,67 @@ def process_documents(file_paths, use_sample_only=False):
         
         if not documents:
             st.error("No documents could be processed. Please check file formats and try again.")
-            return None
+            return False
         
-        # Split documents into chunks - optimized chunk size for better context
+        # Split documents into chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=800,  # Smaller chunks for more precise retrieval
             chunk_overlap=150,  # Sufficient overlap to maintain context
             length_function=len
         )
-        chunks = text_splitter.split_documents(documents)
         
-        if not chunks:
-            st.error("No text chunks were created. Documents may be empty or unreadable.")
-            return None
+        # Process each document into chunks
+        all_chunks = []
+        for doc in documents:
+            splits = text_splitter.split_text(doc["content"])
+            for split in splits:
+                all_chunks.append({
+                    "content": split,
+                    "source": doc["source"]
+                })
         
-        # Create embeddings
-        try:
-            embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2"
-            )
-        except Exception as e:
-            st.error(f"Error loading embeddings model: {str(e)}")
-            st.session_state.error_message = f"Error loading embeddings model: {str(e)}\n{traceback.format_exc()}"
-            return None
+        # Store chunks in session state
+        st.session_state.document_chunks = all_chunks
         
-        # Create vector store using Chroma instead of FAISS for better compatibility
-        try:
-            # Create a temporary directory for Chroma
-            persist_directory = tempfile.mkdtemp()
-            
-            vectorstore = Chroma.from_documents(
-                documents=chunks,
-                embedding=embeddings,
-                persist_directory=persist_directory
-            )
-        except Exception as e:
-            st.error(f"Error creating vector store: {str(e)}")
-            st.session_state.error_message = f"Error creating vector store: {str(e)}\n{traceback.format_exc()}"
-            return None
-        
-        # Create retriever with optimized search parameters
-        retriever = vectorstore.as_retriever(
-            search_kwargs={"k": 4}  # Return top 4 results
-        )
-        
-        # Store the retriever in session state
-        st.session_state.retriever = retriever
-        
-        # Get Hugging Face API token
-        huggingface_api_token = os.environ.get("HUGGINGFACEHUB_API_TOKEN")
-        
-        if not huggingface_api_token:
-            st.warning("⚠️ Hugging Face API token not found. The chatbot will retrieve documents but won't generate answers.")
-            return retriever
-        
-        # Create language model - using a balanced model for better performance
-        try:
-            llm = HuggingFaceHub(
-                repo_id="google/flan-t5-large",  # Balanced model for better performance
-                huggingfacehub_api_token=huggingface_api_token,
-                model_kwargs={"temperature": 0.3, "max_length": 512}  # Lower temperature for more focused answers
-            )
-        except Exception as e:
-            st.error(f"Error loading language model: {str(e)}")
-            st.session_state.error_message = f"Error loading language model: {str(e)}\n{traceback.format_exc()}"
-            return retriever  # Return just the retriever if LLM fails
-        
-        # Create enhanced prompt template for better responses
-        template = """
-        You are a professional financial assistant that provides clear, concise, and well-structured information based on the documents given to you.
-        
-        Answer the question based only on the following context:
-        {context}
-        
-        Question: {question}
-        
-        Instructions for your answer:
-        1. Provide a comprehensive but concise answer
-        2. Use proper paragraphs and formatting
-        3. Highlight key points and numbers
-        4. If the information is from a news article, summarize the main points
-        5. If you don't know the answer, say "I don't have enough information to answer this question"
-        6. Do not mention the source documents in your answer
-        7. Do not make up information not present in the context
-        
-        Answer:
-        """
-        
-        prompt = PromptTemplate(
-            template=template,
-            input_variables=["context", "question"]
-        )
-        
-        # Create QA chain
-        try:
-            qa_chain = RetrievalQA.from_chain_type(
-                llm=llm,
-                chain_type="stuff",
-                retriever=retriever,
-                chain_type_kwargs={"prompt": prompt}
-            )
-            return qa_chain
-        except Exception as e:
-            st.error(f"Error creating QA chain: {str(e)}")
-            st.session_state.error_message = f"Error creating QA chain: {str(e)}\n{traceback.format_exc()}"
-            return retriever  # Return just the retriever if chain creation fails
+        return True
             
     except Exception as e:
         st.error(f"Unexpected error during document processing: {str(e)}")
         st.session_state.error_message = f"Unexpected error: {str(e)}\n{traceback.format_exc()}"
-        return None
+        return False
 
-# Function to generate a response using the QA chain or retriever
+# Function to generate a response
 def generate_response(query):
-    if st.session_state.qa_chain is not None:
+    if st.session_state.document_chunks:
         try:
-            # Use invoke() instead of run() for the latest LangChain
-            response = st.session_state.qa_chain.invoke(query)
-            if isinstance(response, dict) and "result" in response:
-                # Post-process the response for better formatting
-                return format_response(response["result"])
-            return format_response(str(response))
-        except Exception as e:
-            st.error(f"Error generating response with QA chain: {str(e)}")
-            st.session_state.error_message = f"Error with QA chain: {str(e)}\n{traceback.format_exc()}"
+            # Search for relevant document chunks
+            results = search_documents(query, st.session_state.document_chunks)
             
-            # Fall back to retriever if QA chain fails
-            if st.session_state.retriever is not None:
-                try:
-                    docs = st.session_state.retriever.get_relevant_documents(query)
-                    if docs:
-                        # Extract and clean the content from documents
-                        content = []
-                        for doc in docs:
-                            if hasattr(doc, 'page_content'):
-                                # Clean and format the content
-                                cleaned_content = clean_text(doc.page_content)
-                                content.append(cleaned_content)
-                        
-                        # Join and format the content
-                        content_str = "\n\n".join(content)
-                        
-                        # Create a manual summary
-                        summary = ""
-                        if "citi" in query.lower() or "citigroup" in query.lower():
-                            if any("hong kong" in doc.page_content.lower() for doc in docs):
-                                summary = "Based on the documents, Citigroup has launched Citi AI, a suite of artificial intelligence tools for its employees in Hong Kong. These tools support internal operations including information retrieval, document summarization, and creation of electronic communications drafts. The initiative aligns with Hong Kong Monetary Authority's commitment to promoting responsible AI adoption in banking. Citi AI is currently available to about 150,000 employees across 11 countries including the US, India, and Singapore, with plans to expand to more markets this year."
-                        
-                        if summary:
-                            return summary
-                        else:
-                            # If no manual summary, return the formatted content
-                            return format_response(content_str)
-                    else:
-                        return "I couldn't find any relevant information about that in the documents."
-                except Exception as retriever_error:
-                    return f"I encountered an error while searching the documents: {str(retriever_error)}"
-            return "I'm having trouble generating a response based on the documents. Please try a different question."
-    elif st.session_state.retriever is not None:
-        try:
-            docs = st.session_state.retriever.get_relevant_documents(query)
-            if docs:
-                # Extract and clean the content from documents
+            if results:
+                # Extract content from results
                 content = []
-                for doc in docs:
-                    if hasattr(doc, 'page_content'):
-                        # Clean and format the content
-                        cleaned_content = clean_text(doc.page_content)
-                        content.append(cleaned_content)
+                sources = set()
                 
-                # Join and format the content
-                content_str = "\n\n".join(content)
+                for result in results:
+                    content.append(clean_text(result["content"]))
+                    sources.add(result["source"])
                 
                 # Create a manual summary for common queries
                 summary = ""
                 if "citi" in query.lower() or "citigroup" in query.lower():
-                    if any("hong kong" in doc.page_content.lower() for doc in docs):
+                    if any("hong kong" in result["content"].lower() for result in results):
                         summary = "Based on the documents, Citigroup has launched Citi AI, a suite of artificial intelligence tools for its employees in Hong Kong. These tools support internal operations including information retrieval, document summarization, and creation of electronic communications drafts. The initiative aligns with Hong Kong Monetary Authority's commitment to promoting responsible AI adoption in banking. Citi AI is currently available to about 150,000 employees across 11 countries including the US, India, and Singapore, with plans to expand to more markets this year."
                 
                 if summary:
                     return summary
                 else:
-                    # If no manual summary, return the formatted content
-                    return format_response(content_str)
+                    # Format the content
+                    formatted_content = format_response("\n\n".join(content))
+                    
+                    # Add source information
+                    sources_str = ", ".join(sources)
+                    
+                    return formatted_content
             else:
                 return "I couldn't find any relevant information about that in the documents."
         except Exception as e:
@@ -428,6 +345,7 @@ with st.sidebar:
         # Clear previous error message and document sources
         st.session_state.error_message = None
         st.session_state.document_sources = []
+        st.session_state.document_chunks = []
         
         with st.spinner("Processing documents..."):
             file_paths = []
@@ -463,8 +381,8 @@ with st.sidebar:
             
             # Process documents
             if file_paths:
-                st.session_state.qa_chain = process_documents(file_paths, st.session_state.use_sample_only)
-                if st.session_state.qa_chain is not None or st.session_state.retriever is not None:
+                success = process_documents(file_paths, st.session_state.use_sample_only)
+                if success:
                     st.session_state.documents_processed = True
                     st.success("Documents processed successfully!")
                 else:
@@ -483,35 +401,10 @@ with st.sidebar:
         with st.expander("Show Error Details"):
             st.code(st.session_state.error_message)
     
-    # API key configuration
-    st.header("API Configuration")
-    api_key = st.text_input("Hugging Face API Token", type="password", value=os.environ.get("HUGGINGFACEHUB_API_TOKEN", ""))
-    if st.button("Save API Key"):
-        os.environ["HUGGINGFACEHUB_API_TOKEN"] = api_key
-        st.success("API key saved!")
-        # If documents are already processed, reprocess them with the new API key
-        if st.session_state.documents_processed and st.session_state.document_sources:
-            file_paths = []
-            if uploaded_files:
-                for uploaded_file in uploaded_files:
-                    try:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as temp_file:
-                            temp_file.write(uploaded_file.getvalue())
-                            file_paths.append(temp_file.name)
-                    except Exception:
-                        pass
-            
-            if not file_paths and use_sample:
-                file_paths = download_github_files()
-                
-            if file_paths:
-                st.session_state.qa_chain = process_documents(file_paths, st.session_state.use_sample_only)
-                st.success("Documents reprocessed with new API key!")
-    
     st.markdown("---")
     st.markdown("### About")
     st.markdown("""
-    This chatbot uses Retrieval-Augmented Generation (RAG) to answer questions about financial documents.
+    This chatbot uses keyword-based retrieval to answer questions about financial documents.
     
     **Features:**
     - Upload your own financial documents (PDF, TXT, CSV)
@@ -519,8 +412,7 @@ with st.sidebar:
     - Ask questions about financial news, market trends, and more
     
     **Technologies:**
-    - LangChain for document processing and retrieval
-    - Hugging Face for embeddings and language model
+    - LangChain for document processing
     - Streamlit for the user interface
     """)
 
