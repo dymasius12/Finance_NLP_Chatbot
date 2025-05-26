@@ -4,9 +4,9 @@ import tempfile
 import requests
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEndpoint
+from langchain_community.llms import HuggingFaceHub
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 import pandas as pd
@@ -82,10 +82,14 @@ if 'documents_processed' not in st.session_state:
     st.session_state.documents_processed = False
 if 'qa_chain' not in st.session_state:
     st.session_state.qa_chain = None
+if 'retriever' not in st.session_state:
+    st.session_state.retriever = None
 if 'document_sources' not in st.session_state:
     st.session_state.document_sources = []
 if 'error_message' not in st.session_state:
     st.session_state.error_message = None
+if 'use_sample_only' not in st.session_state:
+    st.session_state.use_sample_only = False
 
 # Function to download sample financial documents from GitHub
 @st.cache_data
@@ -133,7 +137,7 @@ def download_github_files():
     return [temp_file_path]
 
 # Function to process documents and create a retrieval QA chain
-def process_documents(file_paths):
+def process_documents(file_paths, use_sample_only=False):
     try:
         documents = []
         
@@ -180,7 +184,7 @@ def process_documents(file_paths):
             st.error("No text chunks were created. Documents may be empty or unreadable.")
             return None
         
-        # Create embeddings using the updated HuggingFaceEmbeddings from langchain_huggingface
+        # Create embeddings
         try:
             embeddings = HuggingFaceEmbeddings(
                 model_name="sentence-transformers/all-MiniLM-L6-v2"
@@ -203,8 +207,11 @@ def process_documents(file_paths):
         
         # Create retriever
         retriever = vectorstore.as_retriever(
-            search_kwargs={"k": 5}
+            search_kwargs={"k": 3}
         )
+        
+        # Store the retriever in session state
+        st.session_state.retriever = retriever
         
         # Get Hugging Face API token
         huggingface_api_token = os.environ.get("HUGGINGFACEHUB_API_TOKEN")
@@ -213,12 +220,12 @@ def process_documents(file_paths):
             st.warning("⚠️ Hugging Face API token not found. The chatbot will retrieve documents but won't generate answers.")
             return retriever
         
-        # Create language model using the updated HuggingFaceEndpoint from langchain_huggingface
+        # Create language model - FIXED: Removed temperature and max_length as direct parameters
         try:
-            llm = HuggingFaceEndpoint(
-                repo_id="google/flan-t5-base",  # Using a more stable model
+            llm = HuggingFaceHub(
+                repo_id="google/flan-t5-xl",  # Using a larger model for better performance
                 huggingfacehub_api_token=huggingface_api_token,
-                model_kwargs={"temperature": 0.5, "max_length": 512}
+                model_kwargs={"temperature": 0.5, "max_length": 512}  # Put temperature and max_length inside model_kwargs
             )
         except Exception as e:
             st.error(f"Error loading language model: {str(e)}")
@@ -262,6 +269,66 @@ def process_documents(file_paths):
         st.session_state.error_message = f"Unexpected error: {str(e)}\n{traceback.format_exc()}"
         return None
 
+# Function to generate a response using the QA chain or retriever
+def generate_response(query):
+    if st.session_state.qa_chain is not None:
+        try:
+            # Use invoke() instead of run() for the latest LangChain
+            response = st.session_state.qa_chain.invoke(query)
+            if isinstance(response, dict) and "result" in response:
+                return response["result"]
+            return str(response)
+        except Exception as e:
+            st.error(f"Error generating response with QA chain: {str(e)}")
+            st.session_state.error_message = f"Error with QA chain: {str(e)}\n{traceback.format_exc()}"
+            
+            # Fall back to retriever if QA chain fails
+            if st.session_state.retriever is not None:
+                try:
+                    docs = st.session_state.retriever.get_relevant_documents(query)
+                    if docs:
+                        # Format the document sources for better readability
+                        sources = []
+                        content = []
+                        for doc in docs:
+                            if hasattr(doc, 'metadata') and 'source' in doc.metadata:
+                                source = doc.metadata['source']
+                                sources.append(f"Source: {os.path.basename(source)}")
+                            content.append(doc.page_content)
+                        
+                        sources_str = "\n".join(sources) if sources else ""
+                        content_str = "\n\n".join(content)
+                        
+                        return f"I found these relevant documents but couldn't generate a complete answer:\n\n{content_str}\n\n{sources_str}"
+                    else:
+                        return "I couldn't find any relevant information in the documents."
+                except Exception as retriever_error:
+                    return f"Error retrieving documents: {str(retriever_error)}"
+            return f"Error generating response: {str(e)}"
+    elif st.session_state.retriever is not None:
+        try:
+            docs = st.session_state.retriever.get_relevant_documents(query)
+            if docs:
+                # Format the document sources for better readability
+                sources = []
+                content = []
+                for doc in docs:
+                    if hasattr(doc, 'metadata') and 'source' in doc.metadata:
+                        source = doc.metadata['source']
+                        sources.append(f"Source: {os.path.basename(source)}")
+                    content.append(doc.page_content)
+                
+                sources_str = "\n".join(sources) if sources else ""
+                content_str = "\n\n".join(content)
+                
+                return f"I found these relevant documents:\n\n{content_str}\n\n{sources_str}"
+            else:
+                return "I couldn't find any relevant information in the documents."
+        except Exception as e:
+            return f"Error retrieving documents: {str(e)}"
+    else:
+        return "Please process some documents first using the sidebar options."
+
 # Main app layout
 st.title("Financial NLP Chatbot")
 st.markdown("Ask questions about financial documents, news, and market trends.")
@@ -271,7 +338,7 @@ with st.sidebar:
     st.header("Document Sources")
     
     # Option to use sample documents
-    use_sample = st.checkbox("Use sample financial documents", value=True)
+    use_sample = st.checkbox("Use sample financial documents", value=False)
     
     # Option to upload custom documents
     uploaded_files = st.file_uploader(
@@ -282,24 +349,14 @@ with st.sidebar:
     
     # Process documents button
     if st.button("Process Documents"):
-        # Clear previous error message
+        # Clear previous error message and document sources
         st.session_state.error_message = None
         st.session_state.document_sources = []
         
         with st.spinner("Processing documents..."):
             file_paths = []
             
-            # Handle sample documents
-            if use_sample:
-                try:
-                    sample_paths = download_github_files()
-                    file_paths.extend(sample_paths)
-                    st.success(f"Loaded {len(sample_paths)} sample document(s)")
-                except Exception as e:
-                    st.error(f"Error loading sample documents: {str(e)}")
-                    st.session_state.error_message = f"Error loading sample documents: {str(e)}\n{traceback.format_exc()}"
-            
-            # Handle uploaded documents
+            # Handle uploaded documents first (prioritize user uploads)
             if uploaded_files:
                 for uploaded_file in uploaded_files:
                     try:
@@ -314,11 +371,24 @@ with st.sidebar:
                 
                 if file_paths:
                     st.success(f"Loaded {len(uploaded_files)} uploaded document(s)")
+                    st.session_state.use_sample_only = False
+            
+            # Handle sample documents only if no uploads or explicitly requested
+            if (not file_paths and use_sample) or use_sample:
+                try:
+                    sample_paths = download_github_files()
+                    file_paths.extend(sample_paths)
+                    st.success(f"Loaded {len(sample_paths)} sample document(s)")
+                    if not uploaded_files:
+                        st.session_state.use_sample_only = True
+                except Exception as e:
+                    st.error(f"Error loading sample documents: {str(e)}")
+                    st.session_state.error_message = f"Error loading sample documents: {str(e)}\n{traceback.format_exc()}"
             
             # Process documents
             if file_paths:
-                st.session_state.qa_chain = process_documents(file_paths)
-                if st.session_state.qa_chain is not None:
+                st.session_state.qa_chain = process_documents(file_paths, st.session_state.use_sample_only)
+                if st.session_state.qa_chain is not None or st.session_state.retriever is not None:
                     st.session_state.documents_processed = True
                     st.success("Documents processed successfully!")
                 else:
@@ -345,9 +415,22 @@ with st.sidebar:
         st.success("API key saved!")
         # If documents are already processed, reprocess them with the new API key
         if st.session_state.documents_processed and st.session_state.document_sources:
-            file_paths = download_github_files()
-            st.session_state.qa_chain = process_documents(file_paths)
-            st.success("Documents reprocessed with new API key!")
+            file_paths = []
+            if uploaded_files:
+                for uploaded_file in uploaded_files:
+                    try:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as temp_file:
+                            temp_file.write(uploaded_file.getvalue())
+                            file_paths.append(temp_file.name)
+                    except Exception:
+                        pass
+            
+            if not file_paths and use_sample:
+                file_paths = download_github_files()
+                
+            if file_paths:
+                st.session_state.qa_chain = process_documents(file_paths, st.session_state.use_sample_only)
+                st.success("Documents reprocessed with new API key!")
     
     st.markdown("---")
     st.markdown("### About")
@@ -396,16 +479,10 @@ if st.button("Send") and user_input:
     # Check if documents have been processed
     if not st.session_state.documents_processed:
         response = "Please process some documents first using the sidebar options."
-    elif st.session_state.qa_chain is None:
-        response = "I'm having trouble accessing the language model. Please check your API key configuration."
     else:
-        # Get response from QA chain
-        try:
-            with st.spinner("Thinking..."):
-                response = st.session_state.qa_chain.run(user_input)
-        except Exception as e:
-            response = f"Error generating response: {str(e)}"
-            st.session_state.error_message = f"Error generating response: {str(e)}\n{traceback.format_exc()}"
+        # Get response using the generate_response function
+        with st.spinner("Thinking..."):
+            response = generate_response(user_input)
     
     # Add bot response to chat history
     st.session_state.chat_history.append({"role": "assistant", "content": response})
