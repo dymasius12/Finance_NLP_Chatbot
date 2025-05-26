@@ -220,11 +220,11 @@ def find_similar_chunks(query_embedding, document_embeddings, document_chunks, t
         query_norm = np.linalg.norm(query_embedding_np)
         doc_norm = np.linalg.norm(doc_embedding_np)
         
-        # Compute cosine similarity
-        if query_norm > 0 and doc_norm > 0:
-            similarity = np.dot(query_embedding_np, doc_embedding_np) / (query_norm * doc_norm)
+        # Compute cosine similarity - FIX: Handle scalar comparison properly
+        if query_norm > 0.0 and doc_norm > 0.0:  # Use scalar comparison
+            similarity = float(np.dot(query_embedding_np, doc_embedding_np)) / (float(query_norm) * float(doc_norm))
         else:
-            similarity = 0
+            similarity = 0.0
         
         similarities.append((i, similarity))
     
@@ -377,7 +377,7 @@ def generate_response(query):
         query_embedding = compute_embeddings([query])
         
         # If embeddings are available, use semantic search
-        if query_embedding is not None and st.session_state.document_embeddings:
+        if query_embedding is not None and len(st.session_state.document_embeddings) > 0:
             # Find similar chunks
             similar_chunks = find_similar_chunks(
                 query_embedding[0], 
