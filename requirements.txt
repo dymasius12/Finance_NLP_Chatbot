@@ -3,4 +3,5 @@ langchain
 langchain-community
 sentence-transformers
 pypdf
+requests
 numpy
