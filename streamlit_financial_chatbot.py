@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import tempfile
 import requests
+import numpy as np
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import pandas as pd
@@ -10,6 +11,8 @@ import zipfile
 from pathlib import Path
 import traceback
 import re
+import json
+from sentence_transformers import SentenceTransformer
 
 # Set page configuration
 st.set_page_config(
@@ -78,12 +81,16 @@ if 'documents_processed' not in st.session_state:
     st.session_state.documents_processed = False
 if 'document_chunks' not in st.session_state:
     st.session_state.document_chunks = []
+if 'document_embeddings' not in st.session_state:
+    st.session_state.document_embeddings = []
 if 'document_sources' not in st.session_state:
     st.session_state.document_sources = []
 if 'error_message' not in st.session_state:
     st.session_state.error_message = None
 if 'use_sample_only' not in st.session_state:
     st.session_state.use_sample_only = False
+if 'embedding_model' not in st.session_state:
+    st.session_state.embedding_model = None
 
 # Function to clean and format text
 def clean_text(text):
@@ -174,30 +181,93 @@ def download_github_files():
     
     return [temp_file_path]
 
-# Simple keyword-based search function
-def search_documents(query, documents, top_k=3):
-    query = query.lower()
-    results = []
+# Function to load the embedding model
+@st.cache_resource
+def get_embedding_model():
+    try:
+        # Load a lightweight sentence transformer model
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        return model
+    except Exception as e:
+        st.error(f"Error loading embedding model: {str(e)}")
+        return None
+
+# Function to compute embeddings
+def compute_embeddings(texts):
+    if st.session_state.embedding_model is None:
+        st.session_state.embedding_model = get_embedding_model()
     
-    # Extract keywords from query
-    keywords = [word.strip() for word in re.split(r'[^\w]', query) if word.strip() and len(word.strip()) > 3]
+    if st.session_state.embedding_model is None:
+        return None
     
-    # Score each document chunk
-    for doc in documents:
-        score = 0
-        content = doc["content"].lower()
+    try:
+        embeddings = st.session_state.embedding_model.encode(texts)
+        return embeddings
+    except Exception as e:
+        st.error(f"Error computing embeddings: {str(e)}")
+        return None
+
+# Function to find most similar chunks using cosine similarity
+def find_similar_chunks(query_embedding, document_embeddings, document_chunks, top_k=3):
+    # Compute cosine similarity
+    similarities = []
+    for i, doc_embedding in enumerate(document_embeddings):
+        # Convert to numpy arrays if they aren't already
+        query_embedding_np = np.array(query_embedding)
+        doc_embedding_np = np.array(doc_embedding)
         
-        # Simple keyword matching
-        for keyword in keywords:
-            if keyword in content:
-                score += content.count(keyword)
+        # Normalize the vectors
+        query_norm = np.linalg.norm(query_embedding_np)
+        doc_norm = np.linalg.norm(doc_embedding_np)
         
-        if score > 0:
-            results.append({"content": doc["content"], "source": doc["source"], "score": score})
+        # Compute cosine similarity
+        if query_norm > 0 and doc_norm > 0:
+            similarity = np.dot(query_embedding_np, doc_embedding_np) / (query_norm * doc_norm)
+        else:
+            similarity = 0
+        
+        similarities.append((i, similarity))
     
-    # Sort by score and return top_k
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:top_k]
+    # Sort by similarity (descending)
+    similarities.sort(key=lambda x: x[1], reverse=True)
+    
+    # Get top_k most similar chunks
+    top_chunks = []
+    for i, similarity in similarities[:top_k]:
+        top_chunks.append({
+            "content": document_chunks[i]["content"],
+            "source": document_chunks[i]["source"],
+            "similarity": similarity
+        })
+    
+    return top_chunks
+
+# Function to call HuggingFace Inference API
+def call_huggingface_api(prompt, api_token):
+    try:
+        API_URL = "https://api-inference.huggingface.co/models/google/flan-t5-large"
+        headers = {"Authorization": f"Bearer {api_token}"}
+        
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_length": 512,
+                "temperature": 0.7
+            }
+        }
+        
+        response = requests.post(API_URL, headers=headers, json=payload)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                return result[0].get("generated_text", "")
+            return str(result)
+        else:
+            return f"Error: API returned status code {response.status_code}"
+    
+    except Exception as e:
+        return f"Error calling HuggingFace API: {str(e)}"
 
 # Function to process documents
 def process_documents(file_paths, use_sample_only=False):
@@ -276,6 +346,17 @@ def process_documents(file_paths, use_sample_only=False):
         # Store chunks in session state
         st.session_state.document_chunks = all_chunks
         
+        # Compute embeddings for all chunks
+        chunk_texts = [chunk["content"] for chunk in all_chunks]
+        embeddings = compute_embeddings(chunk_texts)
+        
+        if embeddings is None:
+            st.error("Failed to compute embeddings. Falling back to keyword search.")
+            return True  # Still return True to allow keyword search fallback
+        
+        # Store embeddings in session state
+        st.session_state.document_embeddings = embeddings
+        
         return True
             
     except Exception as e:
@@ -285,42 +366,110 @@ def process_documents(file_paths, use_sample_only=False):
 
 # Function to generate a response
 def generate_response(query):
-    if st.session_state.document_chunks:
-        try:
-            # Search for relevant document chunks
-            results = search_documents(query, st.session_state.document_chunks)
+    if not st.session_state.document_chunks:
+        return "Please process some documents first using the sidebar options."
+    
+    try:
+        # Get HuggingFace API token
+        api_token = os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+        
+        # Compute query embedding
+        query_embedding = compute_embeddings([query])
+        
+        # If embeddings are available, use semantic search
+        if query_embedding is not None and st.session_state.document_embeddings:
+            # Find similar chunks
+            similar_chunks = find_similar_chunks(
+                query_embedding[0], 
+                st.session_state.document_embeddings,
+                st.session_state.document_chunks,
+                top_k=3
+            )
             
-            if results:
+            if similar_chunks:
                 # Extract content from results
-                content = []
-                sources = set()
+                context = "\n\n".join([chunk["content"] for chunk in similar_chunks])
                 
-                for result in results:
-                    content.append(clean_text(result["content"]))
-                    sources.add(result["source"])
-                
-                # Create a manual summary for common queries
-                summary = ""
-                if "citi" in query.lower() or "citigroup" in query.lower():
-                    if any("hong kong" in result["content"].lower() for result in results):
-                        summary = "Based on the documents, Citigroup has launched Citi AI, a suite of artificial intelligence tools for its employees in Hong Kong. These tools support internal operations including information retrieval, document summarization, and creation of electronic communications drafts. The initiative aligns with Hong Kong Monetary Authority's commitment to promoting responsible AI adoption in banking. Citi AI is currently available to about 150,000 employees across 11 countries including the US, India, and Singapore, with plans to expand to more markets this year."
-                
-                if summary:
-                    return summary
+                # If API token is available, use HuggingFace for reasoning
+                if api_token:
+                    # Create prompt for the LLM
+                    prompt = f"""
+                    Answer the following question based only on the provided context. If the answer cannot be found in the context, say "I don't have enough information to answer this question."
+                    
+                    Context:
+                    {context}
+                    
+                    Question: {query}
+                    
+                    Answer:
+                    """
+                    
+                    # Call HuggingFace API
+                    response = call_huggingface_api(prompt, api_token)
+                    
+                    # Format and return the response
+                    return format_response(response)
                 else:
-                    # Format the content
-                    formatted_content = format_response("\n\n".join(content))
-                    
-                    # Add source information
-                    sources_str = ", ".join(sources)
-                    
-                    return formatted_content
+                    # If no API token, just return the formatted context
+                    return f"Based on the documents, here's what I found (API token not provided for reasoning):\n\n{format_response(context)}"
             else:
                 return "I couldn't find any relevant information about that in the documents."
-        except Exception as e:
-            return f"I encountered an error while searching the documents: {str(e)}"
-    else:
-        return "Please process some documents first using the sidebar options."
+        else:
+            # Fallback to keyword search if embeddings are not available
+            # Simple keyword-based search
+            query_lower = query.lower()
+            results = []
+            
+            # Extract keywords from query
+            keywords = [word.strip() for word in re.split(r'[^\w]', query_lower) if word.strip() and len(word.strip()) > 3]
+            
+            # Score each document chunk
+            for doc in st.session_state.document_chunks:
+                score = 0
+                content = doc["content"].lower()
+                
+                # Simple keyword matching
+                for keyword in keywords:
+                    if keyword in content:
+                        score += content.count(keyword)
+                
+                if score > 0:
+                    results.append({"content": doc["content"], "source": doc["source"], "score": score})
+            
+            # Sort by score and get top results
+            results.sort(key=lambda x: x["score"], reverse=True)
+            top_results = results[:3]
+            
+            if top_results:
+                # Extract content
+                content = "\n\n".join([result["content"] for result in top_results])
+                
+                # If API token is available, use HuggingFace for reasoning
+                if api_token:
+                    # Create prompt for the LLM
+                    prompt = f"""
+                    Answer the following question based only on the provided context. If the answer cannot be found in the context, say "I don't have enough information to answer this question."
+                    
+                    Context:
+                    {content}
+                    
+                    Question: {query}
+                    
+                    Answer:
+                    """
+                    
+                    # Call HuggingFace API
+                    response = call_huggingface_api(prompt, api_token)
+                    
+                    # Format and return the response
+                    return format_response(response)
+                else:
+                    # If no API token, just return the formatted content
+                    return f"Based on keyword search (no embeddings or API token available):\n\n{format_response(content)}"
+            else:
+                return "I couldn't find any relevant information about that in the documents."
+    except Exception as e:
+        return f"I encountered an error while generating a response: {str(e)}"
 
 # Main app layout
 st.title("Financial NLP Chatbot")
@@ -346,6 +495,7 @@ with st.sidebar:
         st.session_state.error_message = None
         st.session_state.document_sources = []
         st.session_state.document_chunks = []
+        st.session_state.document_embeddings = []
         
         with st.spinner("Processing documents..."):
             file_paths = []
@@ -401,10 +551,17 @@ with st.sidebar:
         with st.expander("Show Error Details"):
             st.code(st.session_state.error_message)
     
+    # API key configuration
+    st.header("API Configuration")
+    api_key = st.text_input("Hugging Face API Token", type="password", value=os.environ.get("HUGGINGFACEHUB_API_TOKEN", ""))
+    if st.button("Save API Key"):
+        os.environ["HUGGINGFACEHUB_API_TOKEN"] = api_key
+        st.success("API key saved!")
+    
     st.markdown("---")
     st.markdown("### About")
     st.markdown("""
-    This chatbot uses keyword-based retrieval to answer questions about financial documents.
+    This chatbot uses lightweight embeddings and the HuggingFace API to answer questions about financial documents.
     
     **Features:**
     - Upload your own financial documents (PDF, TXT, CSV)
@@ -412,6 +569,8 @@ with st.sidebar:
     - Ask questions about financial news, market trends, and more
     
     **Technologies:**
+    - Sentence Transformers for document embeddings
+    - HuggingFace API for reasoning
     - LangChain for document processing
     - Streamlit for the user interface
     """)
