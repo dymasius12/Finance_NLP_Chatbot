@@ -23,16 +23,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better appearance
+# Custom CSS for better appearance - only targeting chat messages for black text
 st.markdown("""
 <style>
-    .main {
-        background-color: #f5f7f9;
-    }
-    .stApp {
-        max-width: 1200px;
-        margin: 0 auto;
-    }
     .chat-message {
         padding: 1.5rem;
         border-radius: 0.5rem;
@@ -43,12 +36,10 @@ st.markdown("""
     .chat-message.user {
         background-color: #e6f3ff;
         border-left: 5px solid #2b6cb0;
-        color: #000000;
     }
     .chat-message.bot {
         background-color: #f0fff4;
         border-left: 5px solid #38a169;
-        color: #000000;
     }
     .chat-message .avatar {
         width: 40px;
@@ -77,12 +68,8 @@ st.markdown("""
     .stButton button:hover {
         background-color: #45a049;
     }
-    /* Ensure text is visible */
-    p, h1, h2, h3, h4, h5, h6, span, div {
-        color: #000000;
-    }
-    /* Fix for chat messages */
-    .stMarkdown p {
+    /* Only target the chat message text */
+    .chat-message p {
         color: #000000 !important;
     }
 </style>
