@@ -175,8 +175,57 @@ if 'news_fed_to_chatbot' not in st.session_state:
 POPULAR_TICKERS = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "META", 
     "TSLA", "NVDA", "JPM", "V", "WMT",
-    "JNJ", "PG", "DIS", "NFLX", "INTC"
+    "JNJ", "PG", "DIS", "NFLX", "INTC",
+    "BAC", "KO", "PEP", "CSCO", "ADBE",
+    "CRM", "PYPL", "CMCSA", "XOM", "CVX",
+    "ABT", "TMO", "ACN", "COST", "DHR",
+    "MRK", "UNH", "HD", "MA", "AVGO",
+    "LLY", "PFE", "VZ", "T", "ORCL"
 ]
+
+# Dictionary of ticker symbols to company names for better display
+TICKER_TO_COMPANY = {
+    "AAPL": "Apple Inc.",
+    "MSFT": "Microsoft Corporation",
+    "GOOGL": "Alphabet Inc. (Google)",
+    "AMZN": "Amazon.com, Inc.",
+    "META": "Meta Platforms, Inc. (Facebook)",
+    "TSLA": "Tesla, Inc.",
+    "NVDA": "NVIDIA Corporation",
+    "JPM": "JPMorgan Chase & Co.",
+    "V": "Visa Inc.",
+    "WMT": "Walmart Inc.",
+    "JNJ": "Johnson & Johnson",
+    "PG": "Procter & Gamble Co.",
+    "DIS": "The Walt Disney Company",
+    "NFLX": "Netflix, Inc.",
+    "INTC": "Intel Corporation",
+    "BAC": "Bank of America Corporation",
+    "KO": "The Coca-Cola Company",
+    "PEP": "PepsiCo, Inc.",
+    "CSCO": "Cisco Systems, Inc.",
+    "ADBE": "Adobe Inc.",
+    "CRM": "Salesforce, Inc.",
+    "PYPL": "PayPal Holdings, Inc.",
+    "CMCSA": "Comcast Corporation",
+    "XOM": "Exxon Mobil Corporation",
+    "CVX": "Chevron Corporation",
+    "ABT": "Abbott Laboratories",
+    "TMO": "Thermo Fisher Scientific Inc.",
+    "ACN": "Accenture plc",
+    "COST": "Costco Wholesale Corporation",
+    "DHR": "Danaher Corporation",
+    "MRK": "Merck & Co., Inc.",
+    "UNH": "UnitedHealth Group Incorporated",
+    "HD": "The Home Depot, Inc.",
+    "MA": "Mastercard Incorporated",
+    "AVGO": "Broadcom Inc.",
+    "LLY": "Eli Lilly and Company",
+    "PFE": "Pfizer Inc.",
+    "VZ": "Verizon Communications Inc.",
+    "T": "AT&T Inc.",
+    "ORCL": "Oracle Corporation"
+}
 
 # Function to clean and format text
 def clean_text(text):
@@ -588,7 +637,7 @@ def create_investment_response(context, query):
     # Default to returning the original context if no specific handling
     return None
 
-# Function to analyze sentiment of text
+# Function to analyze sentiment of text with financial context awareness
 def analyze_sentiment(text):
     try:
         if st.session_state.sentiment_analyzer is None:
@@ -597,11 +646,34 @@ def analyze_sentiment(text):
         if not text:
             return {"score": 0, "label": "Neutral", "color": "#6c757d"}
         
-        # Get sentiment scores
+        # Check for financial context that might override standard sentiment
+        lower_text = text.lower()
+        
+        # Words indicating selling/lowering stakes (typically negative for the stock)
+        selling_words = ["sell", "sold", "selling", "lowers", "reduces", "cuts", "dumps", "exits", "downgrades"]
+        
+        # Words indicating buying/raising stakes (typically positive for the stock)
+        buying_words = ["buy", "bought", "buying", "raises", "increases", "adds", "accumulates", "upgrades"]
+        
+        # Check for selling context
+        has_selling_context = any(word in lower_text for word in selling_words)
+        
+        # Check for buying context
+        has_buying_context = any(word in lower_text for word in buying_words)
+        
+        # Get standard sentiment scores
         sentiment = st.session_state.sentiment_analyzer.polarity_scores(text)
         compound_score = sentiment['compound']
         
-        # Determine sentiment label and color
+        # Apply financial context rules to override standard sentiment
+        if has_selling_context and not has_buying_context:
+            # If it's about selling/lowering stakes, it's negative for the stock
+            return {"score": -0.3, "label": "Negative", "color": "#dc3545"}
+        elif has_buying_context and not has_selling_context:
+            # If it's about buying/raising stakes, it's positive for the stock
+            return {"score": 0.3, "label": "Positive", "color": "#28a745"}
+        
+        # If no specific financial context or mixed signals, use standard sentiment
         if compound_score >= 0.05:
             return {"score": compound_score, "label": "Positive", "color": "#28a745"}
         elif compound_score <= -0.05:
@@ -921,10 +993,47 @@ st.markdown("Ask questions about financial documents, news, and market trends.")
 
 # Stock ticker news section
 st.header("Latest Stock News")
+
+# Create a function to filter tickers based on user input
+def filter_tickers(search_term):
+    if not search_term:
+        return POPULAR_TICKERS[:10]  # Return first 10 tickers if no search term
+    
+    # Filter tickers that start with the search term (case insensitive)
+    filtered = [ticker for ticker in POPULAR_TICKERS if ticker.lower().startswith(search_term.lower())]
+    
+    # If no exact matches, try partial matches
+    if not filtered:
+        filtered = [ticker for ticker in POPULAR_TICKERS if search_term.lower() in ticker.lower()]
+    
+    # Add company names to the display if available
+    display_options = []
+    for ticker in filtered[:10]:  # Limit to 10 results
+        if ticker in TICKER_TO_COMPANY:
+            display_options.append(f"{ticker} - {TICKER_TO_COMPANY[ticker]}")
+        else:
+            display_options.append(ticker)
+    
+    return display_options
+
+# Create columns for the ticker search
 ticker_col1, ticker_col2 = st.columns([3, 1])
 
 with ticker_col1:
-    selected_ticker = st.selectbox("Select a stock ticker", POPULAR_TICKERS, index=0)
+    # Use text input for ticker search with autocomplete
+    ticker_input = st.text_input("Enter a stock ticker or start typing for suggestions", key="ticker_input")
+    
+    # Filter tickers based on input
+    filtered_options = filter_tickers(ticker_input)
+    
+    # Display filtered options as a selectbox
+    if filtered_options:
+        selected_option = st.selectbox("Select a ticker", filtered_options, key="ticker_select")
+        
+        # Extract ticker from the selected option (remove company name if present)
+        selected_ticker = selected_option.split(" - ")[0] if " - " in selected_option else selected_option
+    else:
+        selected_ticker = ticker_input.upper() if ticker_input else "AAPL"  # Default to AAPL if no matches
 
 with ticker_col2:
     if st.button("Get Latest News"):
