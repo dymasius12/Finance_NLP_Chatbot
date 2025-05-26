@@ -5,7 +5,7 @@ import requests
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import Chroma
 from langchain_community.llms import HuggingFaceHub
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
@@ -239,11 +239,15 @@ def process_documents(file_paths, use_sample_only=False):
             st.session_state.error_message = f"Error loading embeddings model: {str(e)}\n{traceback.format_exc()}"
             return None
         
-        # Create vector store using FAISS
+        # Create vector store using Chroma instead of FAISS for better compatibility
         try:
-            vectorstore = FAISS.from_documents(
+            # Create a temporary directory for Chroma
+            persist_directory = tempfile.mkdtemp()
+            
+            vectorstore = Chroma.from_documents(
                 documents=chunks,
-                embedding=embeddings
+                embedding=embeddings,
+                persist_directory=persist_directory
             )
         except Exception as e:
             st.error(f"Error creating vector store: {str(e)}")
@@ -252,7 +256,7 @@ def process_documents(file_paths, use_sample_only=False):
         
         # Create retriever with optimized search parameters
         retriever = vectorstore.as_retriever(
-            search_kwargs={"k": 4, "fetch_k": 8}  # Retrieve more candidates but return top 4
+            search_kwargs={"k": 4}  # Return top 4 results
         )
         
         # Store the retriever in session state
