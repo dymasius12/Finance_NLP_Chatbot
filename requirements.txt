@@ -1,8 +1,7 @@
 streamlit
-langchain-community
 langchain
+langchain-community
 chromadb
 sentence-transformers
 pypdf
-tiktoken
 huggingface_hub
