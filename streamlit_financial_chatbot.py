@@ -10,6 +10,15 @@ from sentence_transformers import SentenceTransformer
 import requests
 import json
 from datetime import datetime, timedelta
+import streamlit as st
+import nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+
+# Download NLTK resources if not already present
+try:
+    nltk.data.find('vader_lexicon')
+except LookupError:
+    nltk.download('vader_lexicon', quiet=True)
 
 # Set page configuration
 st.set_page_config(
@@ -19,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better appearance - only targeting chat messages for black text
+# Custom CSS for better appearance - ensuring all text is visible
 st.markdown("""
 <style>
     .chat-message {
@@ -79,6 +88,7 @@ st.markdown("""
         font-weight: bold;
         font-size: 18px;
         margin-bottom: 10px;
+        color: #000000 !important;
     }
     .news-source {
         color: #6c757d;
@@ -93,10 +103,38 @@ st.markdown("""
     .news-description {
         font-size: 16px;
         margin-bottom: 10px;
+        color: #000000 !important;
     }
     .news-link {
         font-size: 14px;
         color: #007bff;
+    }
+    .sentiment-badge {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 12px;
+        font-weight: bold;
+        color: white;
+        margin-left: 10px;
+    }
+    .sentiment-positive {
+        background-color: #28a745;
+    }
+    .sentiment-negative {
+        background-color: #dc3545;
+    }
+    .sentiment-neutral {
+        background-color: #6c757d;
+    }
+    .news-fed-badge {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 12px;
+        background-color: #17a2b8;
+        color: white;
+        margin-left: 10px;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -124,6 +162,14 @@ if 'news_articles' not in st.session_state:
     st.session_state.news_articles = []
 if 'selected_ticker' not in st.session_state:
     st.session_state.selected_ticker = None
+if 'sentiment_analyzer' not in st.session_state:
+    try:
+        st.session_state.sentiment_analyzer = SentimentIntensityAnalyzer()
+    except Exception as e:
+        st.session_state.sentiment_analyzer = None
+        st.error(f"Error loading sentiment analyzer: {str(e)}")
+if 'news_fed_to_chatbot' not in st.session_state:
+    st.session_state.news_fed_to_chatbot = False
 
 # Define popular stock tickers
 POPULAR_TICKERS = [
@@ -542,6 +588,30 @@ def create_investment_response(context, query):
     # Default to returning the original context if no specific handling
     return None
 
+# Function to analyze sentiment of text
+def analyze_sentiment(text):
+    try:
+        if st.session_state.sentiment_analyzer is None:
+            return {"score": 0, "label": "Neutral", "color": "#6c757d"}
+        
+        if not text:
+            return {"score": 0, "label": "Neutral", "color": "#6c757d"}
+        
+        # Get sentiment scores
+        sentiment = st.session_state.sentiment_analyzer.polarity_scores(text)
+        compound_score = sentiment['compound']
+        
+        # Determine sentiment label and color
+        if compound_score >= 0.05:
+            return {"score": compound_score, "label": "Positive", "color": "#28a745"}
+        elif compound_score <= -0.05:
+            return {"score": compound_score, "label": "Negative", "color": "#dc3545"}
+        else:
+            return {"score": compound_score, "label": "Neutral", "color": "#6c757d"}
+    except Exception as e:
+        # Return neutral sentiment in case of error
+        return {"score": 0, "label": "Neutral", "color": "#6c757d"}
+
 # Function to fetch news for a specific ticker
 def fetch_stock_news(ticker, api_key="7a285b0c044f4c2b96bc5e18c1b58f3d", max_articles=2):
     try:
@@ -553,16 +623,21 @@ def fetch_stock_news(ticker, api_key="7a285b0c044f4c2b96bc5e18c1b58f3d", max_art
             data = response.json()
             if data.get("status") == "ok" and data.get("articles"):
                 articles = data.get("articles")
-                return [
-                    {
+                result = []
+                for article in articles[:max_articles]:
+                    # Combine title and description for sentiment analysis
+                    text_for_sentiment = f"{article.get('title', '')} {article.get('description', '')}"
+                    sentiment = analyze_sentiment(text_for_sentiment)
+                    
+                    result.append({
                         "title": article.get("title"),
                         "description": article.get("description"),
                         "url": article.get("url"),
                         "source": article.get("source", {}).get("name", "Unknown"),
-                        "published_at": article.get("publishedAt")
-                    }
-                    for article in articles[:max_articles]
-                ]
+                        "published_at": article.get("publishedAt"),
+                        "sentiment": sentiment
+                    })
+                return result
         
         # If NewsAPI fails, try Yahoo Finance API as fallback
         # This is a simple scraping approach that might work as fallback
@@ -573,16 +648,21 @@ def fetch_stock_news(ticker, api_key="7a285b0c044f4c2b96bc5e18c1b58f3d", max_art
             data = fallback_response.json()
             if "items" in data and "result" in data["items"] and data["items"]["result"]:
                 articles = data["items"]["result"]
-                return [
-                    {
+                result = []
+                for article in articles[:max_articles]:
+                    # Combine title and description for sentiment analysis
+                    text_for_sentiment = f"{article.get('title', '')} {article.get('summary', '')}"
+                    sentiment = analyze_sentiment(text_for_sentiment)
+                    
+                    result.append({
                         "title": article.get("title"),
                         "description": article.get("summary"),
                         "url": article.get("link"),
                         "source": "Yahoo Finance",
-                        "published_at": datetime.fromtimestamp(article.get("published_at", 0)).isoformat()
-                    }
-                    for article in articles[:max_articles]
-                ]
+                        "published_at": datetime.fromtimestamp(article.get("published_at", 0)).isoformat(),
+                        "sentiment": sentiment
+                    })
+                return result
         
         # If both APIs fail, return a mock article as last resort
         return [
@@ -591,7 +671,8 @@ def fetch_stock_news(ticker, api_key="7a285b0c044f4c2b96bc5e18c1b58f3d", max_art
                 "description": "Could not retrieve latest news. Please try again later or check financial news websites directly.",
                 "url": f"https://finance.yahoo.com/quote/{ticker}",
                 "source": "System Message",
-                "published_at": datetime.now().isoformat()
+                "published_at": datetime.now().isoformat(),
+                "sentiment": {"score": 0, "label": "Neutral", "color": "#6c757d"}
             }
         ]
     except Exception as e:
@@ -602,11 +683,12 @@ def fetch_stock_news(ticker, api_key="7a285b0c044f4c2b96bc5e18c1b58f3d", max_art
                 "description": f"Error retrieving news: {str(e)}. Please try again later or check financial news websites directly.",
                 "url": f"https://finance.yahoo.com/quote/{ticker}",
                 "source": "System Message",
-                "published_at": datetime.now().isoformat()
+                "published_at": datetime.now().isoformat(),
+                "sentiment": {"score": 0, "label": "Neutral", "color": "#6c757d"}
             }
         ]
 
-# Function to display news articles
+# Function to display news articles with sentiment
 def display_news_articles(articles):
     if not articles:
         st.warning("No news articles found.")
@@ -614,9 +696,23 @@ def display_news_articles(articles):
     
     for article in articles:
         with st.container():
+            # Get sentiment info
+            sentiment = article.get('sentiment', {"label": "Neutral", "color": "#6c757d"})
+            sentiment_label = sentiment.get('label', 'Neutral')
+            sentiment_class = f"sentiment-{sentiment_label.lower()}"
+            
+            # Check if this news has been fed to chatbot
+            fed_badge = ""
+            if st.session_state.news_fed_to_chatbot:
+                fed_badge = '<span class="news-fed-badge">Added to Chatbot</span>'
+            
             st.markdown(f"""
             <div class="news-card">
-                <div class="news-title">{article.get('title', 'No title')}</div>
+                <div class="news-title">
+                    {article.get('title', 'No title')}
+                    <span class="sentiment-badge {sentiment_class}">{sentiment_label}</span>
+                    {fed_badge}
+                </div>
                 <div class="news-source">Source: {article.get('source', 'Unknown')}</div>
                 <div class="news-date">Published: {article.get('published_at', 'Unknown date')}</div>
                 <div class="news-description">{article.get('description', 'No description available')}</div>
@@ -662,6 +758,41 @@ def add_news_to_documents(articles):
             st.error(f"Error computing embeddings for news: {str(e)}")
             # Continue without embeddings, will fall back to keyword search
 
+# Function to preprocess and improve chatbot responses
+def preprocess_response(response, query):
+    try:
+        # If response is too short or seems like an error message, return as is
+        if not response or len(response) < 50 or "error" in response.lower():
+            return response
+        
+        # Clean up the response
+        response = clean_text(response)
+        
+        # Improve formatting for readability
+        response = format_response(response)
+        
+        # Add specific improvements for different query types
+        if any(term in query.lower() for term in ["what", "how", "why", "when", "where"]):
+            # For question queries, ensure the response is direct and focused
+            if not response.startswith("Based on") and not response.startswith("According to"):
+                response = f"Based on the information I found: {response}"
+        
+        # For news-related queries, highlight the recency of information
+        if any(term in query.lower() for term in ["news", "recent", "latest", "update"]):
+            if "Source: News:" in response:
+                response = f"From the latest news: {response}"
+        
+        # For stock-specific queries, ensure disclaimer is present
+        if any(term in query.lower() for term in ["stock", "buy", "sell", "invest", "price"]):
+            if not "not financial advice" in response.lower() and not "consult" in response.lower():
+                response += "\n\nPlease note that this information is not financial advice. Always consult with a qualified financial advisor before making investment decisions."
+        
+        return response
+    except Exception as e:
+        # If any error occurs during preprocessing, return the original response
+        st.session_state.error_message = f"Response preprocessing error: {str(e)}\n{traceback.format_exc()}"
+        return response
+
 # Function to generate a response
 def generate_response(query):
     try:
@@ -692,14 +823,15 @@ def generate_response(query):
                         if any(term in query.lower() for term in ["stock", "buy", "invest", "recommendation"]):
                             custom_response = create_investment_response(context, query)
                             if custom_response:
-                                return f"{custom_response}\n\nSource: {sources}"
+                                return preprocess_response(f"{custom_response}\n\nSource: {sources}", query)
                         
                         # Create a manual summary for common queries
                         if "citi" in query.lower() or "citigroup" in query.lower():
                             if any("hong kong" in chunk["content"].lower() for chunk in similar_chunks):
-                                return """Based on the documents, Citigroup has launched Citi AI, a suite of artificial intelligence tools for its employees in Hong Kong. These tools support internal operations including information retrieval from Citi's policy library, document summarization, and creation of electronic communications drafts. The initiative aligns with Hong Kong Monetary Authority's commitment to promoting responsible AI adoption in banking. Citi AI is currently available to about 150,000 employees across 11 countries including the United States, India, and Singapore, with plans to expand to more markets this year.
+                                response = """Based on the documents, Citigroup has launched Citi AI, a suite of artificial intelligence tools for its employees in Hong Kong. These tools support internal operations including information retrieval from Citi's policy library, document summarization, and creation of electronic communications drafts. The initiative aligns with Hong Kong Monetary Authority's commitment to promoting responsible AI adoption in banking. Citi AI is currently available to about 150,000 employees across 11 countries including the United States, India, and Singapore, with plans to expand to more markets this year.
 
 Source: Citi_article.pdf"""
+                                return preprocess_response(response, query)
                         
                         # Try to use external LLM API for reasoning
                         try:
@@ -718,13 +850,13 @@ Source: Citi_article.pdf"""
                             
                             # Check if the response seems valid
                             if llm_response and not llm_response.startswith("Error:"):
-                                return f"{llm_response}\n\nSource: {sources}"
+                                return preprocess_response(f"{llm_response}\n\nSource: {sources}", query)
                         except Exception as llm_error:
                             st.session_state.error_message = f"LLM API error: {str(llm_error)}\n{traceback.format_exc()}"
                             # Continue with fallback if LLM fails
                         
                         # Format and return the response with source information
-                        return f"{format_response(context)}\n\nSource: {sources}"
+                        return preprocess_response(f"{format_response(context)}\n\nSource: {sources}", query)
             except Exception as e:
                 # If semantic search fails, fall back to keyword search
                 st.session_state.error_message = f"Semantic search error: {str(e)}\n{traceback.format_exc()}"
@@ -741,14 +873,15 @@ Source: Citi_article.pdf"""
             if any(term in query.lower() for term in ["stock", "buy", "invest", "recommendation"]):
                 custom_response = create_investment_response(content, query)
                 if custom_response:
-                    return f"{custom_response}\n\nSource: {sources}"
+                    return preprocess_response(f"{custom_response}\n\nSource: {sources}", query)
             
             # Create a manual summary for common queries
             if "citi" in query.lower() or "citigroup" in query.lower():
                 if any("hong kong" in result["content"].lower() for result in results):
-                    return """Based on the documents, Citigroup has launched Citi AI, a suite of artificial intelligence tools for its employees in Hong Kong. These tools support internal operations including information retrieval from Citi's policy library, document summarization, and creation of electronic communications drafts. The initiative aligns with Hong Kong Monetary Authority's commitment to promoting responsible AI adoption in banking. Citi AI is currently available to about 150,000 employees across 11 countries including the United States, India, and Singapore, with plans to expand to more markets this year.
+                    response = """Based on the documents, Citigroup has launched Citi AI, a suite of artificial intelligence tools for its employees in Hong Kong. These tools support internal operations including information retrieval from Citi's policy library, document summarization, and creation of electronic communications drafts. The initiative aligns with Hong Kong Monetary Authority's commitment to promoting responsible AI adoption in banking. Citi AI is currently available to about 150,000 employees across 11 countries including the United States, India, and Singapore, with plans to expand to more markets this year.
 
 Source: Citi_article.pdf"""
+                    return preprocess_response(response, query)
             
             # Try to use external LLM API for reasoning
             try:
@@ -767,13 +900,13 @@ Source: Citi_article.pdf"""
                 
                 # Check if the response seems valid
                 if llm_response and not llm_response.startswith("Error:"):
-                    return f"{llm_response}\n\nSource: {sources}"
+                    return preprocess_response(f"{llm_response}\n\nSource: {sources}", query)
             except Exception as llm_error:
                 st.session_state.error_message = f"LLM API error: {str(llm_error)}\n{traceback.format_exc()}"
                 # Continue with fallback if LLM fails
             
             # Format and return the response with source information
-            return f"{format_response(content)}\n\nSource: {sources}"
+            return preprocess_response(f"{format_response(content)}\n\nSource: {sources}", query)
         else:
             return "I couldn't find any relevant information about that in the documents."
     except Exception as e:
@@ -797,6 +930,8 @@ with ticker_col2:
     if st.button("Get Latest News"):
         with st.spinner(f"Fetching latest news for {selected_ticker}..."):
             try:
+                # Reset news fed status
+                st.session_state.news_fed_to_chatbot = False
                 # Fetch news articles
                 articles = fetch_stock_news(selected_ticker)
                 
@@ -807,6 +942,8 @@ with ticker_col2:
                     # Add news to documents for querying
                     if st.session_state.documents_processed:
                         add_news_to_documents(articles)
+                        st.session_state.news_fed_to_chatbot = True
+                        st.success(f"News for {selected_ticker} has been added to the chatbot's knowledge base!")
                 else:
                     st.error(f"No news found for {selected_ticker}")
             except Exception as e:
