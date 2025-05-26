@@ -5,7 +5,7 @@ import requests
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain_community.llms import HuggingFaceHub
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
@@ -13,6 +13,7 @@ import pandas as pd
 import io
 import zipfile
 from pathlib import Path
+import traceback
 
 # Set page configuration
 st.set_page_config(
@@ -42,10 +43,12 @@ st.markdown("""
     .chat-message.user {
         background-color: #e6f3ff;
         border-left: 5px solid #2b6cb0;
+        color: #000000;
     }
     .chat-message.bot {
         background-color: #f0fff4;
         border-left: 5px solid #38a169;
+        color: #000000;
     }
     .chat-message .avatar {
         width: 40px;
@@ -56,6 +59,7 @@ st.markdown("""
     }
     .chat-message .message {
         flex-grow: 1;
+        color: #000000;
     }
     .stButton button {
         background-color: #4CAF50;
@@ -73,6 +77,14 @@ st.markdown("""
     .stButton button:hover {
         background-color: #45a049;
     }
+    /* Ensure text is visible */
+    p, h1, h2, h3, h4, h5, h6, span, div {
+        color: #000000;
+    }
+    /* Fix for chat messages */
+    .stMarkdown p {
+        color: #000000 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -85,6 +97,8 @@ if 'qa_chain' not in st.session_state:
     st.session_state.qa_chain = None
 if 'document_sources' not in st.session_state:
     st.session_state.document_sources = []
+if 'error_message' not in st.session_state:
+    st.session_state.error_message = None
 
 # Function to download sample financial documents from GitHub
 @st.cache_data
@@ -133,102 +147,133 @@ def download_github_files():
 
 # Function to process documents and create a retrieval QA chain
 def process_documents(file_paths):
-    documents = []
-    
-    # Load documents based on file type
-    for file_path in file_paths:
-        try:
-            file_extension = os.path.splitext(file_path)[1].lower()
-            
-            if file_extension == '.pdf':
-                loader = PyPDFLoader(file_path)
-                documents.extend(loader.load())
-                st.session_state.document_sources.append(f"PDF: {os.path.basename(file_path)}")
-            
-            elif file_extension == '.txt':
-                loader = TextLoader(file_path)
-                documents.extend(loader.load())
-                st.session_state.document_sources.append(f"Text: {os.path.basename(file_path)}")
-            
-            elif file_extension == '.csv':
-                loader = CSVLoader(file_path)
-                documents.extend(loader.load())
-                st.session_state.document_sources.append(f"CSV: {os.path.basename(file_path)}")
-            
-            else:
-                st.warning(f"Unsupported file type: {file_extension}")
+    try:
+        documents = []
         
+        # Load documents based on file type
+        for file_path in file_paths:
+            try:
+                file_extension = os.path.splitext(file_path)[1].lower()
+                
+                if file_extension == '.pdf':
+                    loader = PyPDFLoader(file_path)
+                    documents.extend(loader.load())
+                    st.session_state.document_sources.append(f"PDF: {os.path.basename(file_path)}")
+                
+                elif file_extension == '.txt':
+                    loader = TextLoader(file_path)
+                    documents.extend(loader.load())
+                    st.session_state.document_sources.append(f"Text: {os.path.basename(file_path)}")
+                
+                elif file_extension == '.csv':
+                    loader = CSVLoader(file_path)
+                    documents.extend(loader.load())
+                    st.session_state.document_sources.append(f"CSV: {os.path.basename(file_path)}")
+                
+                else:
+                    st.warning(f"Unsupported file type: {file_extension}")
+            
+            except Exception as e:
+                st.error(f"Error processing file {file_path}: {str(e)}")
+                st.session_state.error_message = f"Error processing file: {str(e)}\n{traceback.format_exc()}"
+        
+        if not documents:
+            st.error("No documents could be processed. Please check file formats and try again.")
+            return None
+        
+        # Split documents into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len
+        )
+        chunks = text_splitter.split_documents(documents)
+        
+        if not chunks:
+            st.error("No text chunks were created. Documents may be empty or unreadable.")
+            return None
+        
+        # Create embeddings
+        try:
+            embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2"
+            )
         except Exception as e:
-            st.error(f"Error processing file {file_path}: {str(e)}")
-    
-    if not documents:
+            st.error(f"Error loading embeddings model: {str(e)}")
+            st.session_state.error_message = f"Error loading embeddings model: {str(e)}\n{traceback.format_exc()}"
+            return None
+        
+        # Create vector store using FAISS instead of Chroma
+        try:
+            vectorstore = FAISS.from_documents(
+                documents=chunks,
+                embedding=embeddings
+            )
+        except Exception as e:
+            st.error(f"Error creating vector store: {str(e)}")
+            st.session_state.error_message = f"Error creating vector store: {str(e)}\n{traceback.format_exc()}"
+            return None
+        
+        # Create retriever
+        retriever = vectorstore.as_retriever(
+            search_kwargs={"k": 5}
+        )
+        
+        # Get Hugging Face API token
+        huggingface_api_token = os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+        
+        if not huggingface_api_token:
+            st.warning("⚠️ Hugging Face API token not found. The chatbot will retrieve documents but won't generate answers.")
+            return retriever
+        
+        # Create language model
+        try:
+            llm = HuggingFaceHub(
+                repo_id="google/flan-t5-base",  # Using a more stable model
+                huggingfacehub_api_token=huggingface_api_token,
+                model_kwargs={"temperature": 0.5, "max_length": 512}
+            )
+        except Exception as e:
+            st.error(f"Error loading language model: {str(e)}")
+            st.session_state.error_message = f"Error loading language model: {str(e)}\n{traceback.format_exc()}"
+            return retriever  # Return just the retriever if LLM fails
+        
+        # Create prompt template
+        template = """
+        You are a helpful financial assistant that provides information based on the documents given to you.
+        Answer the question based only on the following context:
+        {context}
+        
+        Question: {question}
+        
+        If you don't know the answer or can't find it in the context, just say "I don't have enough information to answer this question." Don't try to make up an answer.
+        
+        Answer:
+        """
+        
+        prompt = PromptTemplate(
+            template=template,
+            input_variables=["context", "question"]
+        )
+        
+        # Create QA chain
+        try:
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": prompt}
+            )
+            return qa_chain
+        except Exception as e:
+            st.error(f"Error creating QA chain: {str(e)}")
+            st.session_state.error_message = f"Error creating QA chain: {str(e)}\n{traceback.format_exc()}"
+            return retriever  # Return just the retriever if chain creation fails
+            
+    except Exception as e:
+        st.error(f"Unexpected error during document processing: {str(e)}")
+        st.session_state.error_message = f"Unexpected error: {str(e)}\n{traceback.format_exc()}"
         return None
-    
-    # Split documents into chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
-    )
-    chunks = text_splitter.split_documents(documents)
-    
-    # Create embeddings
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
-    
-    # Create vector store
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings
-    )
-    
-    # Create retriever
-    retriever = vectorstore.as_retriever(
-        search_kwargs={"k": 5}
-    )
-    
-    # Get Hugging Face API token
-    huggingface_api_token = os.environ.get("HUGGINGFACEHUB_API_TOKEN")
-    
-    if not huggingface_api_token:
-        st.warning("⚠️ Hugging Face API token not found. The chatbot will retrieve documents but won't generate answers.")
-        return retriever
-    
-    # Create language model
-    llm = HuggingFaceHub(
-        repo_id="google/flan-t5-small",
-        huggingfacehub_api_token=huggingface_api_token,
-        model_kwargs={"temperature": 0.5, "max_length": 512}
-    )
-    
-    # Create prompt template
-    template = """
-    You are a helpful financial assistant that provides information based on the documents given to you.
-    Answer the question based only on the following context:
-    {context}
-    
-    Question: {question}
-    
-    If you don't know the answer or can't find it in the context, just say "I don't have enough information to answer this question." Don't try to make up an answer.
-    
-    Answer:
-    """
-    
-    prompt = PromptTemplate(
-        template=template,
-        input_variables=["context", "question"]
-    )
-    
-    # Create QA chain
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": prompt}
-    )
-    
-    return qa_chain
 
 # Main app layout
 st.title("Financial NLP Chatbot")
@@ -250,29 +295,46 @@ with st.sidebar:
     
     # Process documents button
     if st.button("Process Documents"):
+        # Clear previous error message
+        st.session_state.error_message = None
+        
         with st.spinner("Processing documents..."):
             file_paths = []
             
             # Handle sample documents
             if use_sample:
-                sample_paths = download_github_files()
-                file_paths.extend(sample_paths)
-                st.success(f"Loaded {len(sample_paths)} sample document(s)")
+                try:
+                    sample_paths = download_github_files()
+                    file_paths.extend(sample_paths)
+                    st.success(f"Loaded {len(sample_paths)} sample document(s)")
+                except Exception as e:
+                    st.error(f"Error loading sample documents: {str(e)}")
+                    st.session_state.error_message = f"Error loading sample documents: {str(e)}\n{traceback.format_exc()}"
             
             # Handle uploaded documents
             if uploaded_files:
                 for uploaded_file in uploaded_files:
-                    # Save uploaded file to a temporary file
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as temp_file:
-                        temp_file.write(uploaded_file.getvalue())
-                        file_paths.append(temp_file.name)
-                st.success(f"Loaded {len(uploaded_files)} uploaded document(s)")
+                    try:
+                        # Save uploaded file to a temporary file
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as temp_file:
+                            temp_file.write(uploaded_file.getvalue())
+                            file_paths.append(temp_file.name)
+                        st.success(f"Loaded file: {uploaded_file.name}")
+                    except Exception as e:
+                        st.error(f"Error processing uploaded file {uploaded_file.name}: {str(e)}")
+                        st.session_state.error_message = f"Error processing uploaded file: {str(e)}\n{traceback.format_exc()}"
+                
+                if file_paths:
+                    st.success(f"Loaded {len(uploaded_files)} uploaded document(s)")
             
             # Process documents
             if file_paths:
                 st.session_state.qa_chain = process_documents(file_paths)
-                st.session_state.documents_processed = True
-                st.success("Documents processed successfully!")
+                if st.session_state.qa_chain is not None:
+                    st.session_state.documents_processed = True
+                    st.success("Documents processed successfully!")
+                else:
+                    st.error("Failed to process documents. See error details below.")
             else:
                 st.error("No documents to process.")
     
@@ -281,6 +343,11 @@ with st.sidebar:
         st.subheader("Loaded Documents:")
         for source in st.session_state.document_sources:
             st.write(f"- {source}")
+    
+    # Display error message if any
+    if st.session_state.error_message:
+        with st.expander("Show Error Details"):
+            st.code(st.session_state.error_message)
     
     # API key configuration
     st.header("API Configuration")
@@ -350,17 +417,18 @@ if st.button("Send") and user_input:
                 response = st.session_state.qa_chain.run(user_input)
         except Exception as e:
             response = f"Error generating response: {str(e)}"
+            st.session_state.error_message = f"Error generating response: {str(e)}\n{traceback.format_exc()}"
     
     # Add bot response to chat history
     st.session_state.chat_history.append({"role": "assistant", "content": response})
     
-    # Rerun to update the chat display - using st.rerun() instead of experimental_rerun
+    # Rerun to update the chat display
     st.rerun()
 
 # Clear chat button
 if st.button("Clear Chat"):
     st.session_state.chat_history = []
-    st.rerun()  # Using st.rerun() instead of experimental_rerun
+    st.rerun()
 
 # Footer
 st.markdown("---")
