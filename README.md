@@ -1,3 +1,4 @@
+![RL Agent Architecture](agent_ai.png)
 # 🧠 Finance NLP Chatbot with Reinforcement Learning Trading Strategy
 
 This project combines the power of **Natural Language Processing (NLP)** and **Reinforcement Learning (RL)** to build an intelligent trading assistant. It analyzes financial news sentiment, extracts signals, and makes trading decisions using a custom-trained RL agent—all through an intuitive **Streamlit chatbot interface**.
@@ -9,11 +10,6 @@ This project combines the power of **Natural Language Processing (NLP)** and **R
 - 💬 **Interactive Chatbot**: Retrieval-augmented generation (RAG) chatbot with context-aware responses and financial document lookup.
 - 📈 **Technical Indicators**: Incorporates SMA, EMA, RSI, MACD for enhanced decision-making.
 - 🌐 **Live News Integration**: Fetches news from NewsAPI, Yahoo RSS, and analyst reports.
-
-## 📷 Screenshots
-
-### 🤖 RL Trading Agent Overview
-![RL Agent Architecture](agent_ai.png)
 
 ### 💬 Streamlit Chatbot Interface
 ![Chat UI](streamlit_chat_interface.png)
